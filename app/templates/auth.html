@@ -4,9 +4,12 @@
 <article>
 <h2>{{ "Реєстрація" if mode == "register" else "Вхід" }}</h2>
 <form method="post" action="/{{ mode }}">
+  <input type="hidden" name="next" value="{{ next or '/' }}">
   <label>Email <input type="email" name="email" value="{{ email }}" maxlength="254" required></label>
-  <label>Пароль <input type="password" name="password" minlength="{{ 8 if mode == 'register' else 1 }}" maxlength="128" required></label>
+  <label>Пароль <input type="password" name="password" minlength="{{ 6 if mode == 'register' else 1 }}" maxlength="128" required></label>
   <button type="submit">{{ "Зареєструватися" if mode == "register" else "Увійти" }}</button>
 </form>
+<p>{% if mode == "register" %}Вже маєте акаунт? <a href="/login?next={{ (next or '/')|urlencode }}">Увійти</a>
+{% else %}Немає акаунта? <a href="/register?next={{ (next or '/')|urlencode }}">Зареєструватися</a>{% endif %}</p>
 </article>
 {% endblock %}

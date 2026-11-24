@@ -60,7 +60,7 @@ def test_auth_happy_and_email_normalization():
 
 def test_invalid_register_inputs():
     c = client()
-    for e, p in [("", "password123"), ("nomail", "password123"), ("a@b.co", "short"), ("a@b.co", "x" * 200)]:
+    for e, p in [("", "password123"), ("nomail", "password123"), ("a@b.co", "short"), ("a@b.co", "      "), ("a@b.co", "x" * 200)]:
         assert c.post("/register", data={"email": e, "password": p}).status_code == 400
     assert c.post("/register").status_code == 400
 
@@ -151,7 +151,8 @@ def test_private_event_access():
     assert b.post(f"/events/{eid}/join").status_code == 404
     assert b.post(f"/events/{eid}/comments", data={"body": "x"}).status_code == 404
     assert b.get(f"/events/{eid}/edit").status_code == 404
-    assert b.get(f"/events/{eid}?token={tok}").status_code == 200
+    r = b.get(f"/events/{eid}?token={tok}")
+    assert r.status_code == 303 and r.headers["location"] == f"/events/{eid}"
     assert b.get(f"/events/{eid}").status_code == 200  # збережено в сесії
     assert b.post(f"/events/{eid}/join").status_code == 303
     assert "Приватна" not in b.get("/").text
@@ -247,14 +248,13 @@ def test_forged_cookie_rejected():
     assert c.get("/profile").status_code == 303
 
 
-def test_csrf_missing_origin_and_referer_rejected():
+def test_csrf_foreign_origin_or_referer_rejected():
     c = signup()
     raw = TestClient(app, follow_redirects=False, cookies=c.cookies)
-    assert raw.post("/logout").status_code == 403  # немає ні Origin, ні Referer
-    assert raw.post("/events/new", data={"title": "x"}).status_code == 403
     assert raw.post("/logout", headers={"referer": "https://evil.com/x"}).status_code == 403
     assert raw.post("/logout", headers={"origin": "null"}).status_code == 403
     assert raw.post("/logout", headers={"origin": "http://testserver.evil.com"}).status_code == 403
+    assert raw.post("/events/new", headers={"origin": "https://evil.com"}, data={"title": "x"}).status_code == 403
     assert raw.post("/logout", headers={"referer": "http://testserver/events/1"}).status_code == 303
     assert client().post("/register", headers={"origin": ""}, data={}).status_code in (400, 403)
 
@@ -297,7 +297,7 @@ def test_participants_only_author_even_with_invite():
 def test_sqlite_pragmas_and_cascade_schema():
     c = db.conn()
     try:
-        assert c.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+        assert c.execute("PRAGMA busy_timeout").fetchone()[0] == 15000
         assert c.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert c.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         for t in ("events", "bookings", "comments"):
@@ -435,3 +435,133 @@ def test_flash_messages_and_ux():
     assert "Будьте першим" in c.get(f"/events/{eid}").text
     csp = r.headers.get("content-security-policy", "")
     assert "script-src 'nonce-" in csp and "unsafe-inline" not in csp
+
+
+def test_no_origin_post_allowed_and_referrer_policy():
+    raw = TestClient(app, follow_redirects=False)  # як requests/httpx: без Origin і Referer
+    assert raw.post("/register", data={"email": "n@x.com", "password": "secret"}).status_code == 303
+    eid = mk(raw)
+    assert raw.post(f"/events/{eid}/join").status_code == 303
+    r = raw.get(f"/events/{eid}")
+    assert r.headers["referrer-policy"] == "no-referrer"
+    assert raw.get("/").headers["referrer-policy"] == "no-referrer"
+
+
+def test_invite_token_redirect_and_logout_clears_session():
+    a = signup("a@x.com")
+    eid = mk(a, is_private="on")
+    tok = db.q("SELECT invite_token FROM events WHERE id=?", (eid,), one=True)["invite_token"]
+    g = client()  # гість без акаунта
+    r = g.get(f"/events/{eid}", params={"token": tok})
+    assert r.status_code == 303 and r.headers["location"] == f"/events/{eid}" and tok not in r.headers["location"]
+    page = g.get(f"/events/{eid}")
+    assert page.status_code == 200 and tok not in page.text
+    assert g.get(f"/events/{eid}", params={"token": tok[:-1] + "A"}).status_code in (303, 200)  # доступ уже в сесії
+    assert client().get(f"/events/{eid}", params={"token": tok[:-1] + "A"}).status_code == 404
+    # після входу доступ із запрошення зберігається, після logout — зникає
+    signup("b@x.com")
+    g.post("/login", data={"email": "b@x.com", "password": "password123", "next": f"/events/{eid}"})
+    assert g.get(f"/events/{eid}").status_code == 200
+    assert g.post("/logout").status_code == 303
+    assert g.get(f"/events/{eid}").status_code == 404
+
+
+def test_login_next_redirect_safe():
+    signup("n@x.com")
+    c = client()
+    eid = mk(signup("a@x.com"))
+    page = c.get(f"/events/{eid}").text
+    assert f'href="/login?next=/events/{eid}"' in page
+    assert f'value="/events/{eid}"' in c.get("/login", params={"next": f"/events/{eid}"}).text
+    r = c.post("/login", data={"email": "n@x.com", "password": "password123", "next": f"/events/{eid}"})
+    assert r.headers["location"] == f"/events/{eid}"
+    for bad in ("//evil.com", "https://evil.com", "/\\evil.com", "javascript:alert(1)"):
+        r = client().post("/login", data={"email": "n@x.com", "password": "password123", "next": bad})
+        assert r.headers["location"] == "/", bad
+    r = client().post("/register", data={"email": "q@x.com", "password": "secret", "next": f"/events/{eid}"})
+    assert r.headers["location"] == f"/events/{eid}"
+    assert client().post(f"/events/{eid}/join").headers["location"] == f"/login?next=/events/{eid}"
+
+
+def test_login_error_does_not_reveal_email():
+    signup("e@x.com")
+    r1 = client().post("/login", data={"email": "e@x.com", "password": "wrong-pass"})
+    r2 = client().post("/login", data={"email": "nobody@x.com", "password": "wrong-pass"})
+    assert r1.status_code == r2.status_code == 400
+    assert "Невірний email або пароль" in r1.text and "Невірний email або пароль" in r2.text
+
+
+@pytest.mark.parametrize("when", ["2030-06-01 10:00", "2030-06-01 10:00:00", "2030-06-01T10:00:00Z",
+                                  "2030-06-01T10:00:00+02:00", "2030-06-01t10:00z"])
+def test_edit_form_datetime_local_format(when):
+    c = signup()
+    eid = mk(c, event_at=when)
+    html = c.get(f"/events/{eid}/edit").text
+    v = re.search(r'name="event_at" value="([^"]*)"', html).group(1)
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", v), v
+    d = dict(title="T", description="D", event_at=v, max_spots="5", cover_url="")
+    assert c.post(f"/events/{eid}/edit", data=d).status_code == 303
+    assert c.get(f"/events/{eid}/edit").text.count(f'value="{v}"') == 1
+
+
+def test_public_to_private_generates_token():
+    c = signup()
+    eid = mk(c)
+    db.ex("UPDATE events SET invite_token='' WHERE id=?", (eid,))
+    d = dict(title="T", description="D", event_at=future(), max_spots="5", cover_url="", is_private="on")
+    assert c.post(f"/events/{eid}/edit", data=d).status_code == 303
+    ev = db.q("SELECT is_private, invite_token FROM events WHERE id=?", (eid,), one=True)
+    assert ev["is_private"] == 1 and len(ev["invite_token"]) >= 32
+    assert client().get(f"/events/{eid}").status_code == 404
+
+
+def test_full_event_shows_no_spots():
+    a = signup("a@x.com")
+    eid = mk(a, max_spots="1")
+    b = signup("b@x.com")
+    b.post(f"/events/{eid}/join")
+    pb = b.get(f"/events/{eid}").text
+    assert "Скасувати" in pb and "Місць немає" not in pb
+    pc = signup("c@x.com").get(f"/events/{eid}").text
+    assert "Місць немає" in pc and ">Іду<" not in pc and f"/events/{eid}/join" not in pc
+
+
+def test_profile_lists_with_marks():
+    a = signup("a@x.com")
+    pub = mk(a, title="Публічна")
+    prv = mk(a, title="Закрита", is_private="on")
+    old = mk(a, title="Стара")
+    for e in (pub, prv, old):
+        a.post(f"/events/{e}/join")
+    db.ex("UPDATE events SET event_at='2000-01-01T00:00:00' WHERE id=?", (old,))
+    html = a.get("/profile").text
+    created, joined = html.split("Події, на які я записався")
+    for part in (created, joined):
+        assert "Публічна" in part and "Закрита" in part and "Стара" in part
+        assert part.count("🔒 приватна") == 1 and part.count("минула") == 1 and part.count("майбутня") == 2
+
+
+def test_concurrent_writes_no_errors():
+    a = signup("a@x.com")
+    eid = mk(a, max_spots="10000")
+    users = [signup(f"w{i}@x.com") for i in range(20)]
+    codes, barrier = [], threading.Barrier(len(users))
+
+    def go(cl):
+        barrier.wait()
+        codes.append(cl.post(f"/events/{eid}/join").status_code)
+        codes.append(cl.post(f"/events/{eid}/comments", data={"body": "привіт"}).status_code)
+
+    ts = [threading.Thread(target=go, args=(u,)) for u in users]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert codes.count(303) == 40, codes
+    assert db.q("SELECT COUNT(*) c FROM bookings", one=True)["c"] == 20
+    assert db.q("SELECT COUNT(*) c FROM comments", one=True)["c"] == 20
+
+
+def test_db_dir_autocreated(tmp_path, monkeypatch):
+    p = tmp_path / "nested" / "dir" / "x.db"
+    monkeypatch.setenv("DB_PATH", str(p))
+    db.init_db()
+    assert p.exists()

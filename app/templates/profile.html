@@ -4,10 +4,10 @@
 <h1>Профіль</h1>
 <h2>Створені мною події</h2>
 {% for e in created %}
-<p><a href="/events/{{ e.id }}">{{ e.title }}</a> — {{ e.event_at.replace("T", " ") }}{% if e.is_private %} 🔒{% endif %} ({{ e.taken }}/{{ e.max_spots }})</p>
+<p><a href="/events/{{ e.id }}">{{ e.title }}</a> — {{ e.event_at.replace("T", " ") }}{% if e.is_private %} 🔒 приватна{% endif %} · {{ "майбутня" if e.event_at > now else "минула" }} ({{ e.taken }}/{{ e.max_spots }})</p>
 {% else %}<p class="empty"><span class="big">📝</span>Ви ще не створили жодної події. <a href="/events/new">Створити</a></p>{% endfor %}
 <h2>Події, на які я записався</h2>
 {% for e in joined %}
-<p><a href="/events/{{ e.id }}">{{ e.title }}</a> — {{ e.event_at.replace("T", " ") }}</p>
+<p><a href="/events/{{ e.id }}">{{ e.title }}</a> — {{ e.event_at.replace("T", " ") }}{% if e.is_private %} 🔒 приватна{% endif %} · {{ "майбутня" if e.event_at > now else "минула" }}</p>
 {% else %}<p class="empty"><span class="big">🎟️</span>Ви ще нікуди не записані. <a href="/">Переглянути події</a></p>{% endfor %}
 {% endblock %}

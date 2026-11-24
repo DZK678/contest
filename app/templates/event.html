@@ -12,9 +12,10 @@
     {% if booked %}
     <form method="post" action="/events/{{ ev.id }}/leave"><button class="secondary">Скасувати</button></form>
     {% else %}
-    <form method="post" action="/events/{{ ev.id }}/join"><button {% if ev.max_spots - ev.taken <= 0 %}disabled{% endif %}>{{ "Місць немає" if ev.max_spots - ev.taken <= 0 else "Іду" }}</button></form>
+    {% if ev.max_spots - ev.taken <= 0 %}<p><strong>Місць немає</strong></p>
+    {% else %}<form method="post" action="/events/{{ ev.id }}/join"><button>Іду</button></form>{% endif %}
     {% endif %}
-  {% else %}<p><a href="/login">Увійдіть</a>, щоб записатися.</p>{% endif %}
+  {% else %}<p><a href="{{ login_next }}">Увійдіть</a>, щоб записатися.</p>{% endif %}
 </article>
 {% if is_author %}
 <article>
@@ -38,5 +39,5 @@
   <textarea name="body" maxlength="1000" placeholder="Ваш коментар" required></textarea>
   <button type="submit">Надіслати</button>
 </form>
-{% else %}<p><a href="/login">Увійдіть</a>, щоб коментувати.</p>{% endif %}
+{% else %}<p><a href="{{ login_next }}">Увійдіть</a>, щоб коментувати.</p>{% endif %}
 {% endblock %}

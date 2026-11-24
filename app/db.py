@@ -1,6 +1,8 @@
 import os
 import secrets
 import sqlite3
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 
 SCHEMA = """
@@ -44,10 +46,26 @@ def now_iso():
     return datetime.now().isoformat(timespec="seconds")
 
 
+# Глобальне серіалізування записів у межах процесу: жодних "database is locked" під навантаженням
+WRITE_LOCK = threading.Lock()
+
+
+@contextmanager
+def write_conn():
+    with WRITE_LOCK:
+        c = conn()
+        try:
+            yield c
+        finally:
+            c.close()
+
+
 def conn():
-    c = sqlite3.connect(db_path(), timeout=5, isolation_level=None, check_same_thread=False)
+    path = db_path()
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    c = sqlite3.connect(path, timeout=15, isolation_level=None, check_same_thread=False)
     c.row_factory = sqlite3.Row
-    c.execute("PRAGMA busy_timeout = 5000")
+    c.execute("PRAGMA busy_timeout = 15000")
     c.execute("PRAGMA foreign_keys = ON")
     return c
 
@@ -88,13 +106,10 @@ def _migrate_cascade(c):
 
 
 def init_db():
-    c = conn()
-    try:
+    with write_conn() as c:
         c.execute("PRAGMA journal_mode=WAL")
         _schema(c)
         _migrate_cascade(c)
-    finally:
-        c.close()
 
 
 def q(sql, args=(), one=False):
@@ -107,12 +122,8 @@ def q(sql, args=(), one=False):
 
 
 def ex(sql, args=()):
-    c = conn()
-    try:
-        cur = c.execute(sql, args)
-        return cur.lastrowid
-    finally:
-        c.close()
+    with write_conn() as c:
+        return c.execute(sql, args).lastrowid
 
 
 def create_user(email, pw_hash):
@@ -132,7 +143,12 @@ def create_event(author_id, title, description, event_at, max_spots, cover_url, 
 
 def update_event(event_id, author_id, title, description, event_at, max_spots, cover_url, is_private):
     """Атомарно: 'ok' | 'notfound' | 'forbidden' | 'too_few'."""
-    c = conn()
+    WRITE_LOCK.acquire()
+    try:
+        c = conn()
+    except Exception:
+        WRITE_LOCK.release()
+        raise
     try:
         c.execute("BEGIN IMMEDIATE")
         ev = c.execute("SELECT author_id FROM events WHERE id=?", (event_id,)).fetchone()
@@ -146,10 +162,13 @@ def update_event(event_id, author_id, title, description, event_at, max_spots, c
         if max_spots < cnt:
             c.execute("ROLLBACK")
             return "too_few"
+        # публічна → приватна без токена: генеруємо новий криптографічний invite_token
         c.execute(
-            "UPDATE events SET title=?,description=?,event_at=?,max_spots=?,cover_url=?,is_private=?"
+            "UPDATE events SET title=?,description=?,event_at=?,max_spots=?,cover_url=?,is_private=?,"
+            " invite_token=CASE WHEN ?=1 AND COALESCE(invite_token,'')='' THEN ? ELSE invite_token END"
             " WHERE id=? AND author_id=?",
-            (title, description, event_at, max_spots, cover_url, int(is_private), event_id, author_id))
+            (title, description, event_at, max_spots, cover_url, int(is_private), int(is_private),
+             secrets.token_urlsafe(24), event_id, author_id))
         c.execute("COMMIT")
         return "ok"
     except Exception:
@@ -158,10 +177,16 @@ def update_event(event_id, author_id, title, description, event_at, max_spots, c
         raise
     finally:
         c.close()
+        WRITE_LOCK.release()
 
 
 def _tx(fn):
-    c = conn()
+    WRITE_LOCK.acquire()
+    try:
+        c = conn()
+    except Exception:
+        WRITE_LOCK.release()
+        raise
     try:
         c.execute("BEGIN IMMEDIATE")
         res = fn(c)
@@ -174,6 +199,7 @@ def _tx(fn):
         raise
     finally:
         c.close()
+        WRITE_LOCK.release()
 
 
 def delete_event(event_id, author_id):
@@ -201,7 +227,12 @@ def unbook(event_id, user_id):
 
 def book(event_id, user_id):
     """Атомарний запис: 'ok' | 'notfound' | 'past' | 'dup' | 'full'."""
-    c = conn()
+    WRITE_LOCK.acquire()
+    try:
+        c = conn()
+    except Exception:
+        WRITE_LOCK.release()
+        raise
     try:
         c.execute("BEGIN IMMEDIATE")
         ev = c.execute("SELECT max_spots,event_at FROM events WHERE id=?", (event_id,)).fetchone()
@@ -224,3 +255,4 @@ def book(event_id, user_id):
         raise
     finally:
         c.close()
+        WRITE_LOCK.release()
