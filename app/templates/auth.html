@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}{{ "Реєстрація" if mode == "register" else "Вхід" }} — Тусовка{% endblock %}
+{% block content %}
+<article>
+<h2>{{ "Реєстрація" if mode == "register" else "Вхід" }}</h2>
+{% if error %}<p role="alert"><mark>{{ error }}</mark></p>{% endif %}
+<form method="post" action="/{{ mode }}">
+  <label>Email <input type="email" name="email" value="{{ email }}" maxlength="254" required></label>
+  <label>Пароль <input type="password" name="password" minlength="{{ 8 if mode == 'register' else 1 }}" maxlength="128" required></label>
+  <button type="submit">{{ "Зареєструватися" if mode == "register" else "Увійти" }}</button>
+</form>
+</article>
+{% endblock %}

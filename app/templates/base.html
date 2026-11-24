@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Тусовка{% endblock %}</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2.0.6/css/pico.min.css">
+</head>
+<body>
+<header class="container">
+<nav>
+  <ul><li><a href="/"><strong>🎉 Тусовка</strong></a></li></ul>
+  <ul>
+  {% if user %}
+    <li><a href="/events/new">Створити подію</a></li>
+    <li><a href="/profile">Профіль</a></li>
+    <li><form method="post" action="/logout" style="margin:0"><button class="secondary outline" type="submit">Вийти ({{ user.email }})</button></form></li>
+  {% else %}
+    <li><a href="/login">Увійти</a></li>
+    <li><a href="/register">Реєстрація</a></li>
+  {% endif %}
+  </ul>
+</nav>
+</header>
+<main class="container">{% block content %}{% endblock %}</main>
+</body>
+</html>

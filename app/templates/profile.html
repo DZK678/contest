@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Профіль — Тусовка{% endblock %}
+{% block content %}
+<h1>Профіль</h1>
+<h2>Створені мною події</h2>
+{% for e in created %}
+<p><a href="/events/{{ e.id }}">{{ e.title }}</a> — {{ e.event_at.replace("T", " ") }}{% if e.is_private %} 🔒{% endif %} ({{ e.taken }}/{{ e.max_spots }})</p>
+{% else %}<p>Поки немає.</p>{% endfor %}
+<h2>Події, на які я записався</h2>
+{% for e in joined %}
+<p><a href="/events/{{ e.id }}">{{ e.title }}</a> — {{ e.event_at.replace("T", " ") }}</p>
+{% else %}<p>Поки немає.</p>{% endfor %}
+{% endblock %}

@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}{{ ev.title }} — Тусовка{% endblock %}
+{% block content %}
+{% if flash %}<p><mark>{{ flash }}</mark></p>{% endif %}
+<article>
+  {% if ev.cover_url %}<img src="{{ ev.cover_url }}" alt="Обкладинка" referrerpolicy="no-referrer">{% endif %}
+  <h1>{{ ev.title }}{% if ev.is_private %} 🔒{% endif %}</h1>
+  <p>📅 {{ ev.event_at.replace("T", " ") }} · Автор: {{ ev.author_email }}</p>
+  <p style="white-space:pre-wrap">{{ ev.description }}</p>
+  <p><strong>Вільних місць: {{ ev.max_spots - ev.taken }}</strong> з {{ ev.max_spots }}</p>
+  {% if past %}<p><em>Подія вже минула.</em></p>
+  {% elif user %}
+    {% if booked %}
+    <form method="post" action="/events/{{ ev.id }}/leave"><button class="secondary">Скасувати</button></form>
+    {% else %}
+    <form method="post" action="/events/{{ ev.id }}/join"><button {% if ev.max_spots - ev.taken <= 0 %}disabled{% endif %}>Іду</button></form>
+    {% endif %}
+  {% else %}<p><a href="/login">Увійдіть</a>, щоб записатися.</p>{% endif %}
+</article>
+{% if is_author %}
+<article>
+  <h3>Керування</h3>
+  <a href="/events/{{ ev.id }}/edit" role="button">Редагувати</a>
+  <form method="post" action="/events/{{ ev.id }}/delete" style="display:inline"><button class="contrast">Видалити</button></form>
+  {% if invite_url %}<p>Посилання-запрошення: <code>{{ invite_url }}</code></p>{% endif %}
+  <h4>Учасники ({{ participants|length }})</h4>
+  <ul>{% for p in participants %}<li>{{ p.email }}</li>{% else %}<li>Ще немає</li>{% endfor %}</ul>
+</article>
+{% endif %}
+<h3>Коментарі</h3>
+{% for c in comments %}
+<article><small>{{ c.email }} · {{ c.created_at }}</small><p style="white-space:pre-wrap">{{ c.body }}</p></article>
+{% else %}<p>Коментарів ще немає.</p>{% endfor %}
+{% if user %}
+<form method="post" action="/events/{{ ev.id }}/comments">
+  <textarea name="body" maxlength="1000" placeholder="Ваш коментар" required></textarea>
+  <button type="submit">Надіслати</button>
+</form>
+{% else %}<p><a href="/login">Увійдіть</a>, щоб коментувати.</p>{% endif %}
+{% endblock %}

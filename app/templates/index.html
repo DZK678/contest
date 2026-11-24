@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Найближчі події</h1>
+<form method="get" action="/" role="search">
+  <input type="search" name="q" value="{{ q }}" placeholder="Пошук за назвою" maxlength="100">
+  <button type="submit">Шукати</button>
+</form>
+{% for e in events %}
+<article>
+  <h3><a href="/events/{{ e.id }}">{{ e.title }}</a></h3>
+  <p>📅 {{ e.event_at.replace("T", " ") }} · Вільних місць: {{ e.max_spots - e.taken }} з {{ e.max_spots }}</p>
+</article>
+{% else %}
+<p>Подій не знайдено.</p>
+{% endfor %}
+{% endblock %}
