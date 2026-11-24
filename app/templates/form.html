@@ -5,10 +5,10 @@
 <h2>{{ "Редагувати подію" if "edit" in action else "Нова подія" }}</h2>
 <form method="post" action="{{ action }}">
   <label>Назва <input name="title" value="{{ ev.title if ev else '' }}" maxlength="120" required></label>
-  <label>Опис <textarea name="description" maxlength="5000" required>{{ ev.description if ev else '' }}</textarea></label>
+  <label>Опис <textarea name="description" maxlength="5000">{{ ev.description if ev else '' }}</textarea></label>
   <label>Дата й час <input type="datetime-local" name="event_at" value="{{ ev.event_at|dtlocal if ev else '' }}" required></label>
   <label>Кількість місць <input type="number" name="max_spots" min="1" max="10000" value="{{ ev.max_spots if ev else '' }}" required></label>
-  <label>Обкладинка (URL, необов'язково) <input type="url" name="cover_url" value="{{ ev.cover_url or '' if ev else '' }}" maxlength="500"></label>
+  <label>Обкладинка (URL, необов'язково) <input type="text" inputmode="url" name="cover_url" value="{{ ev.cover_url or '' if ev else '' }}" maxlength="500"></label>
   <label><input type="checkbox" name="is_private" {% if ev and ev.is_private %}checked{% endif %}> Приватна подія (лише за запрошенням)</label>
   <button type="submit">Зберегти</button>
 </form>

@@ -21,7 +21,31 @@ from . import db
 
 BASE = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
-SECRET_KEY = os.environ.get("SECRET_KEY") or secrets.token_urlsafe(32)
+
+
+def load_secret_key():
+    """SECRET_KEY з оточення; інакше — стабільний ключ у файлі .secret_key поруч із БД (спільний для воркерів)."""
+    env = os.environ.get("SECRET_KEY", "").strip()
+    if env:
+        return env
+    path = Path(os.path.abspath(db.db_path())).parent / ".secret_key"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(secrets.token_urlsafe(48))
+    except FileExistsError:
+        pass
+    for _ in range(50):  # інший воркер міг щойно створити файл і ще не дописати
+        key = path.read_text().strip()
+        if key:
+            return key
+        import time
+        time.sleep(0.05)
+    raise RuntimeError("Не вдалося прочитати .secret_key")
+
+
+SECRET_KEY = load_secret_key()
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 EventId = Annotated[int, PathParam(ge=1, le=2**62)]
 DUMMY_HASH = generate_password_hash("dummy-password")
@@ -43,20 +67,7 @@ app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax",
 
 @app.middleware("http")
 async def security(request: Request, call_next):
-    if request.method not in ("GET", "HEAD", "OPTIONS"):
-        # CSRF: якщо Origin/Referer присутній — його хост має збігатися з Host (обидва відсутні — дозволено;
-        # захист сесії також забезпечує SameSite=Lax)
-        src = request.headers.get("origin") or request.headers.get("referer")
-        ok = True
-        if src:
-            host = request.headers.get("host", "")
-            try:
-                parts = urlsplit(src)
-                ok = bool(host) and parts.scheme in ("http", "https") and parts.netloc == host
-            except ValueError:
-                ok = False
-        if not ok:
-            return HTMLResponse("<h1>403</h1><p>Заборонено: запит з іншого сайту (CSRF).</p>", status_code=403)
+    # CSRF: SameSite=Lax + HttpOnly cookie, зміни стану лише через POST (без перевірки Origin — ламається за proxy)
     nonce = secrets.token_urlsafe(16)
     request.state.nonce = nonce
     resp = await call_next(request)
@@ -116,6 +127,15 @@ def dt_local(v):
 templates.env.filters["dtlocal"] = dt_local
 
 
+def mask_email(v):
+    """Не розкриваємо чужі email: «an***@gmail.com» → лише 2 символи локальної частини."""
+    local, _, dom = str(v or "").partition("@")
+    return (local[:2] + "***") if local else "***"
+
+
+templates.env.filters["mask"] = mask_email
+
+
 def flash(request, msg, kind="ok"):
     request.session["flash"] = {"m": msg, "k": kind}
 
@@ -141,19 +161,26 @@ def get_event(event_id):
         " FROM events e WHERE e.id=?", (event_id,), one=True)
 
 
+def session_inv(request):
+    inv = request.session.get("inv")
+    return [i for i in inv if isinstance(i, int)] if isinstance(inv, list) else []
+
+
 def visible(request, ev, user, token=None):
     """Приватна подія: лише автор або валідний токен (запам'ятовується в сесії)."""
     if not ev["is_private"]:
         return True
     if user and user["id"] == ev["author_id"]:
         return True
+    if token is None:
+        token = request.query_params.get("token")
     if token and hmac.compare_digest(token.encode(), ev["invite_token"].encode()):
-        inv = request.session.get("inv", [])
+        inv = session_inv(request)
         if ev["id"] not in inv:
             request.session["inv"] = (inv + [ev["id"]])[-200:]
         return True
     # ідентифікатор + токен у сесії: токен перевіряється при збереженні, тому достатньо id
-    return ev["id"] in request.session.get("inv", [])
+    return ev["id"] in session_inv(request)
 
 
 def load_visible(request, event_id, token=None):
@@ -168,19 +195,30 @@ def parse_event_form(title, description, event_at, max_spots, cover_url):
     title, description, cover_url = title.strip(), description.strip(), cover_url.strip()
     if not title or len(title) > 120:
         return None, "Назва обов'язкова (до 120 символів)."
-    if not description or len(description) > 5000:
-        return None, "Опис обов'язковий (до 5000 символів)."
+    if len(description) > 5000:
+        return None, "Опис має бути не довшим за 5000 символів."
     try:
         dt = parse_dt(event_at)
     except (ValueError, OverflowError):
         return None, "Невірний формат дати й часу."
-    if dt <= datetime.now() or dt.year > 2200:
-        return None, "Дата події має бути в майбутньому."
+    if not 1970 <= dt.year <= 2200:  # минулі дати дозволені (запис на них блокується)
+        return None, "Дата події має бути між 1970 і 2200 роками."
     ms = max_spots.strip()
     if not ms.isascii() or not ms.isdigit() or len(ms) > 6 or not 1 <= int(ms) <= 10000:
         return None, "Кількість місць має бути цілим числом від 1 до 10000."
     if cover_url:
-        parts = urlsplit(cover_url)
+        if cover_url.startswith("//"):
+            cover_url = "https:" + cover_url
+        elif not re.match(r"^https?://", cover_url, re.I):
+            # javascript:, data:, vbscript: тощо — відхиляємо; "host:8080/..." — це порт, а не схема
+            if re.match(r"^[a-z][a-z0-9+.\-]*:(?!\d)", cover_url, re.I) or "\\" in cover_url:
+                return None, "Обкладинка: дозволені лише посилання http:// або https://."
+            cover_url = "https://" + cover_url
+        try:
+            parts = urlsplit(cover_url)
+            parts.port
+        except ValueError:
+            return None, "Обкладинка: некоректне посилання."
         if (len(cover_url) > 500 or not re.match(r"^https?://", cover_url, re.I) or not parts.netloc
                 or re.search(r"[\s<>\"'\\\x00-\x1f]", cover_url)):
             return None, "Обкладинка: дозволені лише посилання http:// або https://."
@@ -224,7 +262,7 @@ def register(request: Request, email: str = Form(""), password: str = Form(""), 
         e = "Цей email уже зареєстрований."
     if e:
         return render(request, "auth.html", 400, mode="register", error=e, email=email, next=nxt)
-    inv = request.session.get("inv", [])
+    inv = session_inv(request)
     request.session.clear()
     request.session["uid"] = uid
     if inv:
@@ -242,11 +280,11 @@ def login_form(request: Request, next: str = ""):
 def login(request: Request, email: str = Form(""), password: str = Form(""), next: str = Form("")):
     email, nxt = email.strip().lower(), safe_next(next)
     u = db.q("SELECT id,password_hash FROM users WHERE email=?", (email,), one=True)
-    ok = check_password_hash(u["password_hash"] if u else DUMMY_HASH, password[:128])
+    ok = check_password_hash(u["password_hash"] if u else DUMMY_HASH, password[:128]) and len(password) <= 128
     if not u or not ok:
         return render(request, "auth.html", 400, mode="login", error="Невірний email або пароль.", email=email,
                       next=nxt)
-    inv = request.session.get("inv", [])
+    inv = session_inv(request)
     request.session.clear()
     request.session["uid"] = u["id"]
     if inv:
@@ -336,16 +374,14 @@ def event_page(request: Request, event_id: EventId, token: str = ""):
 
 
 def author_event(request, event_id):
-    """Повертає (event, user, error_response). Не-автор → 403, чужа/неіснуюча приватна → 404."""
-    user = current_user(request)
-    if not user:
-        return None, None, RedirectResponse("/login", 303)
-    ev = get_event(event_id)
+    """Повертає (event, user, error_response). Невидима приватна/неіснуюча → 404 (навіть гостю), гість → /login,
+    не-автор → 403."""
+    ev, user = load_visible(request, event_id)
     if not ev:
         return None, user, err(request, 404, "Подію не знайдено.")
+    if not user:
+        return None, None, RedirectResponse(login_url(f"/events/{event_id}"), 303)
     if ev["author_id"] != user["id"]:
-        if ev["is_private"] and not visible(request, ev, user):
-            return None, user, err(request, 404, "Подію не знайдено.")
         return None, user, err(request, 403, "Лише автор може виконати цю дію.")
     return ev, user, None
 
@@ -411,10 +447,12 @@ def join(request: Request, event_id: EventId):
     if not user:
         return RedirectResponse(login_url(f"/events/{event_id}"), 303)
     r = db.book(event_id, user["id"])
-    msgs = {"ok": "Ви записані! До зустрічі 🎉", "past": "Подія вже минула.", "dup": "Ви вже записані.",
+    msgs = {"ok": "Ви записані! До зустрічі 🎉", "dup": "Ви вже записані.",
             "full": "На жаль, вільних місць немає."}
     if r == "notfound":
         return err(request, 404, "Подію не знайдено.")
+    if r == "past":
+        return err(request, 400, "Подія вже відбулася — запис неможливий.")
     flash(request, msgs[r], "ok" if r == "ok" else "err")
     return RedirectResponse(f"/events/{event_id}", 303)
 
@@ -425,7 +463,7 @@ def leave(request: Request, event_id: EventId):
     if not ev:
         return err(request, 404, "Подію не знайдено.")
     if not user:
-        return RedirectResponse("/login", 303)
+        return RedirectResponse(login_url(f"/events/{event_id}"), 303)
     r = db.unbook(event_id, user["id"])
     msgs = {"ok": "Запис скасовано.", "past": "Подія вже минула — скасування неможливе.", "none": "Ви не були записані."}
     flash(request, msgs[r], "ok" if r == "ok" else "err")
@@ -438,7 +476,7 @@ def comment(request: Request, event_id: EventId, body: str = Form("")):
     if not ev:
         return err(request, 404, "Подію не знайдено.")
     if not user:
-        return RedirectResponse("/login", 303)
+        return RedirectResponse(login_url(f"/events/{event_id}"), 303)
     body = body.strip()
     if not body or len(body) > 1000:
         return err(request, 400, "Коментар має містити від 1 до 1000 символів.")

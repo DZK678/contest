@@ -95,8 +95,8 @@ def test_comment_requires_login_and_validation():
 
 
 @pytest.mark.parametrize("over", [
-    {"title": "  "}, {"title": "x" * 121}, {"description": ""}, {"event_at": "garbage"},
-    {"event_at": "2001-01-01T10:00"}, {"max_spots": "0"}, {"max_spots": "10001"}, {"max_spots": "-1"},
+    {"title": "  "}, {"title": "x" * 121}, {"event_at": "garbage"},
+    {"event_at": "1800-01-01T10:00"}, {"max_spots": "0"}, {"max_spots": "10001"}, {"max_spots": "-1"},
     {"max_spots": "abc"}, {"max_spots": "1.5"}, {"cover_url": "javascript:alert(1)"},
     {"cover_url": "data:text/html;base64,AAAA"}, {"cover_url": "ftp://x.com/a.png"},
     {"cover_url": "https://x.com/a b.png"},
@@ -167,9 +167,10 @@ def test_duplicate_and_past_booking():
     assert db.q("SELECT COUNT(*) c FROM bookings", one=True)["c"] == 1
     db.ex("UPDATE events SET event_at=? WHERE id=?", ((datetime.now() - timedelta(days=1)).isoformat(timespec="seconds"), eid))
     b = signup("b@x.com")
-    b.post(f"/events/{eid}/join")
+    assert b.post(f"/events/{eid}/join").status_code == 400
     assert db.q("SELECT COUNT(*) c FROM bookings", one=True)["c"] == 1
-    assert "Іду" not in b.get(f"/events/{eid}").text
+    page = b.get(f"/events/{eid}").text
+    assert "Іду" not in page and "Подія вже відбулася" in page
     assert eid not in [r["id"] for r in db.q("SELECT id FROM events WHERE event_at>?", (db.now_iso(),))]
     assert "Вечірка" not in b.get("/").text
 
@@ -232,13 +233,14 @@ def test_sqli_search_and_login():
     assert client().post("/login", data={"email": "' OR '1'='1", "password": "x"}).status_code == 400
 
 
-def test_csrf_origin_and_cookie_flags():
+def test_cookie_flags_and_no_origin_check():
     c = client()
     r = c.post("/register", data={"email": "q@x.com", "password": "password123"})
     sc = r.headers["set-cookie"].lower()
     assert "httponly" in sc and "samesite=lax" in sc
-    assert c.post("/logout", headers={"origin": "https://evil.com"}).status_code == 403
-    assert c.post("/logout", headers={"origin": "http://testserver"}).status_code == 303
+    # за proxy Origin може не збігатися з Host — не блокуємо (захист: SameSite=Lax + лише POST)
+    assert c.post("/logout", headers={"origin": "https://external.example"}).status_code == 303
+    assert client().get("/logout").status_code == 405
 
 
 def test_forged_cookie_rejected():
@@ -246,17 +248,6 @@ def test_forged_cookie_rejected():
     c.cookies.set("session", "eyJ1aWQiOiAxfQ==.abc.def")
     assert "Увійти" in c.get("/").text
     assert c.get("/profile").status_code == 303
-
-
-def test_csrf_foreign_origin_or_referer_rejected():
-    c = signup()
-    raw = TestClient(app, follow_redirects=False, cookies=c.cookies)
-    assert raw.post("/logout", headers={"referer": "https://evil.com/x"}).status_code == 403
-    assert raw.post("/logout", headers={"origin": "null"}).status_code == 403
-    assert raw.post("/logout", headers={"origin": "http://testserver.evil.com"}).status_code == 403
-    assert raw.post("/events/new", headers={"origin": "https://evil.com"}, data={"title": "x"}).status_code == 403
-    assert raw.post("/logout", headers={"referer": "http://testserver/events/1"}).status_code == 303
-    assert client().post("/register", headers={"origin": ""}, data={}).status_code in (400, 403)
 
 
 def test_private_post_endpoints_and_search_leak():
@@ -381,11 +372,11 @@ def test_datetime_formats_no_500(when):
 
 
 @pytest.mark.parametrize("over", [
-    {"description": "   \n\t "}, {"title": "\u00a0 \t"}, {"description": "x" * 5001},
-    {"event_at": "9" * 5000}, {"event_at": "2030-13-40T10:00"}, {"event_at": "1999-01-01T10:00:00+14:00"},
+    {"title": "\u00a0 \t"}, {"description": "x" * 5001},
+    {"event_at": "9" * 5000}, {"event_at": "2030-13-40T10:00"}, {"event_at": "2300-01-01T10:00:00+14:00"},
     {"max_spots": "١٢"}, {"max_spots": "9" * 50}, {"max_spots": " "}, {"cover_url": "https://" + "a" * 600},
     {"cover_url": "https://x.com/\"onerror=\"alert(1)"}, {"cover_url": "JaVaScRiPt:alert(1)"},
-    {"cover_url": "//evil.com/a.png"}, {"cover_url": "https://"},
+    {"cover_url": "vbscript:x"}, {"cover_url": "https://"}, {"cover_url": "https://x.com:99999/a.png"},
 ])
 def test_more_invalid_inputs_400(over):
     c = signup()
@@ -565,3 +556,111 @@ def test_db_dir_autocreated(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(p))
     db.init_db()
     assert p.exists()
+
+
+def test_past_event_created_hidden_from_home_but_viewable():
+    a = signup()
+    past = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M")
+    eid = mk(a, title="Минула тусовка", event_at=past)
+    fut = mk(a, title="Майбутня тусовка")
+    idx = a.get("/").text
+    assert "Минула тусовка" not in idx and "Майбутня тусовка" in idx
+    assert "Минула" not in a.get("/", params={"q": "минула"}).text.split("</form>", 1)[1]
+    page = a.get(f"/events/{eid}")
+    assert page.status_code == 200 and "Подія вже відбулася" in page.text and ">Іду<" not in page.text
+    assert a.post(f"/events/{eid}/join").status_code == 400
+    prof = a.get("/profile").text
+    assert "Минула тусовка" in prof and "Майбутня тусовка" in prof
+    d = dict(title="Знову минула", description="", event_at=past, max_spots="3", cover_url="")
+    assert a.post(f"/events/{fut}/edit", data=d).status_code == 303
+    assert "Знову минула" not in a.get("/").text
+
+
+def test_optional_description_and_cover_autoprefix():
+    a = signup()
+    eid = mk(a, description="", cover_url="example.com/pic.png")
+    assert db.q("SELECT cover_url FROM events WHERE id=?", (eid,), one=True)["cover_url"] == "https://example.com/pic.png"
+    eid2 = mk(a, description="", cover_url="")
+    assert db.q("SELECT cover_url FROM events WHERE id=?", (eid2,), one=True)["cover_url"] is None
+    for bad in ("javascript:alert(1)", "data:image/png;base64,AA", " JavaScript:alert(1)"):
+        d = dict(title="T", description="", event_at=future(), max_spots="5", cover_url=bad)
+        assert a.post("/events/new", data=d).status_code == 400
+
+
+def test_private_event_404_everywhere_for_strangers_and_guests():
+    a = signup("a@x.com")
+    eid = mk(a, is_private="on")
+    data = dict(title="H", description="", event_at=future(), max_spots="5", cover_url="")
+    for c in (client(), signup("b@x.com")):
+        assert c.get(f"/events/{eid}").status_code == 404
+        assert c.get(f"/events/{eid}/edit").status_code == 404
+        assert c.get(f"/events/{eid}/participants").status_code == 404
+        for path, d in (("edit", data), ("delete", None), ("join", None), ("leave", None),
+                        ("comments", {"body": "x"})):
+            assert c.post(f"/events/{eid}/{path}", data=d).status_code == 404, path
+            assert c.post(f"/events/{eid}/{path}?token=bad", data=d).status_code == 404, path
+    assert db.q("SELECT COUNT(*) c FROM events", one=True)["c"] == 1
+
+
+def test_guest_invite_survives_login_and_register():
+    a = signup("a@x.com")
+    eid = mk(a, is_private="on")
+    tok = db.q("SELECT invite_token FROM events WHERE id=?", (eid,), one=True)["invite_token"]
+    g = client()
+    assert g.get(f"/events/{eid}?token={tok}").status_code == 303
+    assert g.get(f"/events/{eid}").status_code == 200
+    assert g.post("/register", data={"email": "g@x.com", "password": "password123"}).status_code == 303
+    assert g.get(f"/events/{eid}").status_code == 200
+    assert g.post(f"/events/{eid}/join").status_code == 303
+    g.post("/logout")
+    assert g.get(f"/events/{eid}").status_code == 404
+    g2 = client()
+    g2.get(f"/events/{eid}?token={tok}")
+    assert g2.post("/login", data={"email": "g@x.com", "password": "password123"}).status_code == 303
+    assert g2.get(f"/events/{eid}").status_code == 200
+
+
+def test_no_foreign_email_or_token_leak():
+    a = signup("author@x.com")
+    eid = mk(a, is_private="on")
+    tok = db.q("SELECT invite_token FROM events WHERE id=?", (eid,), one=True)["invite_token"]
+    b = signup("bob@x.com")
+    b.get(f"/events/{eid}?token={tok}")
+    b.post(f"/events/{eid}/comments", data={"body": "hi"})
+    page = b.get(f"/events/{eid}").text
+    assert "author@x.com" not in page and tok not in page and "bob@x.com" in page
+    assert "bob@x.com" in a.get(f"/events/{eid}").text
+    for t in ("auth.html", "base.html", "error.html", "event.html", "form.html", "index.html", "profile.html"):
+        assert "|safe" not in open(os.path.join(os.path.dirname(db.__file__), "templates", t)).read().replace(" ", "")
+
+
+def test_password_bounds_and_bad_params_no_500():
+    c = client()
+    assert c.post("/register", data={"email": "p@x.com", "password": "x" * 129}).status_code == 400
+    assert c.post("/register", data={"email": "p@x.com", "password": "12345"}).status_code == 400
+    assert c.post("/register", data={"email": "p@x.com", "password": "123456"}).status_code == 303
+    assert client().post("/login", data={"email": "p@x.com", "password": "x" * 10000}).status_code == 400
+    for url in ("/events/abc", "/events/-1", "/events/99999999999999999999999", "/events/1/edit?x=%00"):
+        r = c.get(url)
+        assert r.status_code in (400, 404) and "application/json" not in r.headers["content-type"]
+    r = c.post("/events/new", content=b"\xff\xfe", headers={"content-type": "application/x-www-form-urlencoded"})
+    assert r.status_code == 400
+
+
+def test_csp_allows_any_http_images():
+    csp = client().get("/").headers["content-security-policy"]
+    assert "img-src http: https:" in csp
+
+
+def test_secret_key_file_stable(tmp_path, monkeypatch):
+    from app import main
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "sub" / "x.db"))
+    k1 = main.load_secret_key()
+    assert k1 and k1 == main.load_secret_key() and (tmp_path / "sub" / ".secret_key").exists()
+
+
+def test_cyrillic_case_insensitive_search():
+    a = signup()
+    mk(a, title="ЮВІЛЕЙ Їжака")
+    assert "ЮВІЛЕЙ" in a.get("/", params={"q": "ювілей їжака"}).text

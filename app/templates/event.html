@@ -4,10 +4,10 @@
 <article>
   {% if ev.cover_url %}<img class="cover" src="{{ ev.cover_url }}" alt="Обкладинка події" referrerpolicy="no-referrer" loading="lazy">{% endif %}
   <h1>{{ ev.title }}{% if ev.is_private %} 🔒{% endif %}</h1>
-  <p>📅 {{ ev.event_at.replace("T", " ") }} · Автор: {{ ev.author_email }}</p>
-  <p class="pre">{{ ev.description }}</p>
+  <p>📅 {{ ev.event_at.replace("T", " ") }} · Автор: {{ ev.author_email if is_author else ev.author_email|mask }}</p>
+  {% if ev.description %}<p class="pre">{{ ev.description }}</p>{% endif %}
   <p><strong>Вільних місць: {{ ev.max_spots - ev.taken }}</strong> з {{ ev.max_spots }}</p>
-  {% if past %}<p><em>Подія вже минула.</em></p>
+  {% if past %}<p><strong>Подія вже відбулася</strong></p>
   {% elif user %}
     {% if booked %}
     <form method="post" action="/events/{{ ev.id }}/leave"><button class="secondary">Скасувати</button></form>
@@ -32,7 +32,7 @@
 {% endif %}
 <h3>Коментарі</h3>
 {% for c in comments %}
-<article><small>{{ c.email }} · {{ c.created_at }}</small><p class="pre">{{ c.body }}</p></article>
+<article><small>{{ c.email if is_author or (user and user.email == c.email) else c.email|mask }} · {{ c.created_at }}</small><p class="pre">{{ c.body }}</p></article>
 {% else %}<p class="empty"><span class="big">💬</span>Коментарів ще немає. Будьте першим!</p>{% endfor %}
 {% if user %}
 <form method="post" action="/events/{{ ev.id }}/comments">
