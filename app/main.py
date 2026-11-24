@@ -2,6 +2,7 @@ import hmac
 import os
 import re
 import secrets
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -43,18 +44,25 @@ app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax",
 @app.middleware("http")
 async def security(request: Request, call_next):
     if request.method not in ("GET", "HEAD", "OPTIONS"):
-        origin = request.headers.get("origin")
-        if origin and origin != "null" and urlsplit(origin).netloc != request.headers.get("host", ""):
-            return HTMLResponse("Заборонено (CSRF)", status_code=403)
-        if origin == "null":
-            return HTMLResponse("Заборонено (CSRF)", status_code=403)
+        # CSRF: обов'язковий Origin або Referer, що збігається з Host (відсутність = відмова)
+        src = request.headers.get("origin") or request.headers.get("referer") or ""
+        host = request.headers.get("host", "")
+        try:
+            parts = urlsplit(src)
+            ok = bool(host) and parts.scheme in ("http", "https") and parts.netloc == host
+        except ValueError:
+            ok = False
+        if not ok:
+            return HTMLResponse("<h1>403</h1><p>Заборонено: запит з іншого сайту (CSRF).</p>", status_code=403)
+    nonce = secrets.token_urlsafe(16)
+    request.state.nonce = nonce
     resp = await call_next(request)
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "same-origin"
     resp.headers["Content-Security-Policy"] = (
-        "default-src 'self'; img-src http: https:; style-src 'self' https://cdn.jsdelivr.net; "
-        "script-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        f"default-src 'self'; img-src http: https:; style-src 'self' 'nonce-{nonce}' https://cdn.jsdelivr.net; "
+        f"script-src 'nonce-{nonce}'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
     return resp
 
 
@@ -66,8 +74,17 @@ def current_user(request):
     return db.q("SELECT id,email FROM users WHERE id=?", (uid,), one=True)
 
 
+def flash(request, msg, kind="ok"):
+    request.session["flash"] = {"m": msg, "k": kind}
+
+
 def render(request, name, status=200, **ctx):
     ctx.setdefault("user", current_user(request))
+    f = request.session.pop("flash", None)
+    if ctx.get("error"):
+        f = {"m": ctx["error"], "k": "err"}
+    ctx["flash"] = f if isinstance(f, dict) else None
+    ctx["nonce"] = getattr(request.state, "nonce", "")
     return templates.TemplateResponse(request, name, ctx, status_code=status)
 
 
@@ -112,6 +129,8 @@ def parse_event_form(title, description, event_at, max_spots, cover_url):
     if not description or len(description) > 5000:
         return None, "Опис обов'язковий (до 5000 символів)."
     try:
+        if len(event_at) > 40:
+            raise ValueError
         dt = datetime.fromisoformat(event_at.strip())
         if dt.tzinfo:
             dt = dt.astimezone().replace(tzinfo=None)
@@ -137,6 +156,11 @@ def parse_event_form(title, description, event_at, max_spots, cover_url):
 async def http_exc(request, exc):
     msgs = {404: "Сторінку не знайдено.", 403: "Доступ заборонено.", 405: "Метод не дозволено."}
     return render(request, "error.html", exc.status_code, message=msgs.get(exc.status_code, "Помилка."))
+
+
+@app.exception_handler(sqlite3.OperationalError)
+async def db_busy(request, exc):
+    return render(request, "error.html", 503, message="Сервіс тимчасово перевантажений, спробуйте ще раз.")
 
 
 @app.exception_handler(RequestValidationError)
@@ -165,6 +189,7 @@ def register(request: Request, email: str = Form(""), password: str = Form("")):
         return render(request, "auth.html", 400, mode="register", error=e, email=email)
     request.session.clear()
     request.session["uid"] = uid
+    flash(request, "Реєстрація успішна. Ласкаво просимо!")
     return RedirectResponse("/", 303)
 
 
@@ -182,12 +207,14 @@ def login(request: Request, email: str = Form(""), password: str = Form("")):
         return render(request, "auth.html", 400, mode="login", error="Невірний email або пароль.", email=email)
     request.session.clear()
     request.session["uid"] = u["id"]
+    flash(request, "Ви увійшли.")
     return RedirectResponse("/", 303)
 
 
 @app.post("/logout")
 def logout(request: Request):
     request.session.clear()
+    flash(request, "Ви вийшли з акаунта.")
     return RedirectResponse("/", 303)
 
 
@@ -238,6 +265,7 @@ def create(request: Request, title: str = Form(""), description: str = Form(""),
                       error=e, action="/events/new")
     eid = db.create_event(user["id"], vals["title"], vals["description"], vals["event_at"], vals["max_spots"],
                           vals["cover_url"], bool(is_private))
+    flash(request, "Подію створено!" + (" Скопіюйте посилання-запрошення нижче." if is_private else ""))
     return RedirectResponse(f"/events/{eid}", 303)
 
 
@@ -253,9 +281,8 @@ def event_page(request: Request, event_id: EventId, token: str = ""):
                     " WHERE c.event_id=? ORDER BY c.id", (event_id,))
     participants = db.q("SELECT u.email FROM bookings b JOIN users u ON u.id=b.user_id WHERE b.event_id=?"
                         " ORDER BY b.id", (event_id,)) if is_author else None
-    msg = request.session.pop("flash", None)
     return render(request, "event.html", ev=ev, is_author=is_author, booked=booked, comments=comments,
-                  participants=participants, past=ev["event_at"] <= db.now_iso(), flash=msg,
+                  participants=participants, past=ev["event_at"] <= db.now_iso(),
                   invite_url=str(request.url_for("event_page", event_id=ev["id"])) + "?token=" + ev["invite_token"]
                   if is_author and ev["is_private"] else None)
 
@@ -282,8 +309,8 @@ def participants(request: Request, event_id: EventId):
         return bad
     rows = db.q("SELECT u.email,b.created_at FROM bookings b JOIN users u ON u.id=b.user_id WHERE b.event_id=?"
                 " ORDER BY b.id", (event_id,))
-    return render(request, "error.html", message="Учасники: " + (", ".join(r["email"] for r in rows) or "ще немає"),
-                  title="Учасники")
+    return render(request, "error.html", title=f"Учасники «{ev['title']}»", items=[r["email"] for r in rows],
+                  message=None if rows else "Ще ніхто не записався.", back=f"/events/{event_id}")
 
 
 @app.get("/events/{event_id}/edit", response_class=HTMLResponse)
@@ -311,8 +338,9 @@ def edit(request: Request, event_id: EventId, title: str = Form(""), description
         if r == "notfound":
             return err(request, 404, "Подію не знайдено.")
         if r == "too_few":
-            e = "Місць не може бути менше, ніж уже записалося."
+            e = f"Місць не може бути менше, ніж уже записалося учасників ({ev['taken']})."
         else:
+            flash(request, "Зміни збережено.")
             return RedirectResponse(f"/events/{event_id}", 303)
     return render(request, "form.html", 400, ev=form, error=e, action=f"/events/{event_id}/edit")
 
@@ -323,6 +351,7 @@ def delete(request: Request, event_id: EventId):
     if bad:
         return bad
     db.delete_event(event_id, user["id"])
+    flash(request, "Подію видалено.")
     return RedirectResponse("/profile", 303)
 
 
@@ -334,10 +363,11 @@ def join(request: Request, event_id: EventId):
     if not user:
         return RedirectResponse("/login", 303)
     r = db.book(event_id, user["id"])
-    msgs = {"ok": "Ви записані!", "past": "Подія вже минула.", "dup": "Ви вже записані.", "full": "Вільних місць немає."}
+    msgs = {"ok": "Ви записані! До зустрічі 🎉", "past": "Подія вже минула.", "dup": "Ви вже записані.",
+            "full": "На жаль, вільних місць немає."}
     if r == "notfound":
         return err(request, 404, "Подію не знайдено.")
-    request.session["flash"] = msgs[r]
+    flash(request, msgs[r], "ok" if r == "ok" else "err")
     return RedirectResponse(f"/events/{event_id}", 303)
 
 
@@ -348,8 +378,9 @@ def leave(request: Request, event_id: EventId):
         return err(request, 404, "Подію не знайдено.")
     if not user:
         return RedirectResponse("/login", 303)
-    db.ex("DELETE FROM bookings WHERE event_id=? AND user_id=?", (event_id, user["id"]))
-    request.session["flash"] = "Запис скасовано."
+    r = db.unbook(event_id, user["id"])
+    msgs = {"ok": "Запис скасовано.", "past": "Подія вже минула — скасування неможливе.", "none": "Ви не були записані."}
+    flash(request, msgs[r], "ok" if r == "ok" else "err")
     return RedirectResponse(f"/events/{event_id}", 303)
 
 
@@ -364,6 +395,7 @@ def comment(request: Request, event_id: EventId, body: str = Form("")):
     if not body or len(body) > 1000:
         return err(request, 400, "Коментар має містити від 1 до 1000 символів.")
     db.ex("INSERT INTO comments(event_id,user_id,body) VALUES(?,?,?)", (event_id, user["id"], body))
+    flash(request, "Коментар додано.")
     return RedirectResponse(f"/events/{event_id}", 303)
 
 

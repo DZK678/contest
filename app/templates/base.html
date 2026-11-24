@@ -5,6 +5,19 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}Тусовка{% endblock %}</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2.0.6/css/pico.min.css">
+<style nonce="{{ nonce }}">
+.flash{padding:.75rem 1rem;border-radius:.5rem;margin-bottom:1rem;border-left:5px solid #2e7d32;background:#e8f5e9;color:#1b5e20}
+.flash.err{border-color:#c62828;background:#ffebee;color:#b71c1c}
+.cover{width:100%;max-height:320px;object-fit:cover;border-radius:.5rem}
+.cover-fallback{display:flex;align-items:center;justify-content:center;height:180px;border-radius:.5rem;background:linear-gradient(135deg,#7c4dff,#ff4081);color:#fff;font-size:3rem}
+.empty{text-align:center;padding:2rem 1rem;opacity:.85}
+.empty .big{font-size:2.5rem;display:block}
+.pre{white-space:pre-wrap}
+.inline{display:inline;margin:0}
+.copy-row{display:flex;gap:.5rem}
+.copy-row input{margin:0}
+.copy-row button{width:auto;margin:0;white-space:nowrap}
+</style>
 </head>
 <body>
 <header class="container">
@@ -14,7 +27,7 @@
   {% if user %}
     <li><a href="/events/new">Створити подію</a></li>
     <li><a href="/profile">Профіль</a></li>
-    <li><form method="post" action="/logout" style="margin:0"><button class="secondary outline" type="submit">Вийти ({{ user.email }})</button></form></li>
+    <li><form method="post" action="/logout" class="inline"><button class="secondary outline" type="submit">Вийти ({{ user.email }})</button></form></li>
   {% else %}
     <li><a href="/login">Увійти</a></li>
     <li><a href="/register">Реєстрація</a></li>
@@ -22,6 +35,32 @@
   </ul>
 </nav>
 </header>
-<main class="container">{% block content %}{% endblock %}</main>
+<main class="container">
+{% if flash %}<div class="flash {{ 'err' if flash.k == 'err' else 'ok' }}" role="{{ 'alert' if flash.k == 'err' else 'status' }}">{{ flash.m }}</div>{% endif %}
+{% block content %}{% endblock %}
+</main>
+<script nonce="{{ nonce }}">
+(function () {
+  function fallback(img) {
+    var d = document.createElement("div");
+    d.className = "cover-fallback"; d.setAttribute("aria-label", "Обкладинка недоступна"); d.textContent = "🎉";
+    img.replaceWith(d);
+  }
+  document.querySelectorAll("img.cover").forEach(function (img) {
+    img.addEventListener("error", function () { fallback(img); }); // onerror-fallback для битого URL
+    if (img.complete && img.naturalWidth === 0) fallback(img);
+  });
+  document.querySelectorAll("[data-copy]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var inp = document.getElementById(btn.dataset.copy), done = function () {
+        btn.textContent = "Скопійовано ✓"; setTimeout(function () { btn.textContent = "Копіювати"; }, 2000);
+      };
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(inp.value).then(done);
+      } else { inp.select(); document.execCommand("copy"); done(); }
+    });
+  });
+})();
+</script>
 </body>
 </html>

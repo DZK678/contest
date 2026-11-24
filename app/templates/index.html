@@ -8,9 +8,12 @@
 {% for e in events %}
 <article>
   <h3><a href="/events/{{ e.id }}">{{ e.title }}</a></h3>
-  <p>📅 {{ e.event_at.replace("T", " ") }} · Вільних місць: {{ e.max_spots - e.taken }} з {{ e.max_spots }}</p>
+  <p>📅 {{ e.event_at.replace("T", " ")[:16] }} · Вільних місць: {{ e.max_spots - e.taken }} з {{ e.max_spots }}</p>
 </article>
 {% else %}
-<p>Подій не знайдено.</p>
+<div class="empty"><span class="big">🔍</span>
+{% if q %}<p>За запитом «{{ q }}» нічого не знайдено.</p><a href="/">Показати всі події</a>
+{% else %}<p>Поки що немає запланованих подій.</p>{% if user %}<a href="/events/new" role="button">Створити першу подію</a>{% else %}<a href="/register">Зареєструйтеся</a>, щоб створити подію.{% endif %}{% endif %}
+</div>
 {% endfor %}
 {% endblock %}

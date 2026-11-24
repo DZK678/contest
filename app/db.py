@@ -45,18 +45,54 @@ def now_iso():
 
 
 def conn():
-    c = sqlite3.connect(db_path(), timeout=15, isolation_level=None)
+    c = sqlite3.connect(db_path(), timeout=5, isolation_level=None, check_same_thread=False)
     c.row_factory = sqlite3.Row
-    c.execute("PRAGMA foreign_keys=ON")
-    c.execute("PRAGMA busy_timeout=15000")
+    c.execute("PRAGMA busy_timeout = 5000")
+    c.execute("PRAGMA foreign_keys = ON")
     return c
+
+
+def _schema(c):
+    for stmt in SCHEMA.split(";"):
+        if stmt.strip():
+            c.execute(stmt)
+
+
+def _migrate_cascade(c):
+    """Старі БД без ON DELETE CASCADE: перебудовуємо таблиці зі збереженням даних."""
+    tables = [t for t in ("events", "bookings", "comments")
+              if any(fk["on_delete"].upper() != "CASCADE"
+                     for fk in c.execute(f"PRAGMA foreign_key_list({t})").fetchall())]
+    if not tables:
+        return
+    c.execute("PRAGMA foreign_keys = OFF")
+    c.execute("PRAGMA legacy_alter_table = ON")  # не переписувати посилання FK в інших таблицях
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        for t in tables:
+            c.execute(f"ALTER TABLE {t} RENAME TO _old_{t}")
+        _schema(c)
+        for t in tables:
+            new = {r["name"] for r in c.execute(f"PRAGMA table_info({t})")}
+            cols = ",".join(r["name"] for r in c.execute(f"PRAGMA table_info(_old_{t})") if r["name"] in new)
+            c.execute(f"INSERT INTO {t}({cols}) SELECT {cols} FROM _old_{t}")
+        for t in tables:
+            c.execute(f"DROP TABLE _old_{t}")
+        _schema(c)  # відновити індекси
+        c.execute("COMMIT")
+    finally:
+        if c.in_transaction:
+            c.execute("ROLLBACK")
+        c.execute("PRAGMA legacy_alter_table = OFF")
+        c.execute("PRAGMA foreign_keys = ON")
 
 
 def init_db():
     c = conn()
     try:
         c.execute("PRAGMA journal_mode=WAL")
-        c.executescript(SCHEMA)
+        _schema(c)
+        _migrate_cascade(c)
     finally:
         c.close()
 
@@ -124,12 +160,43 @@ def update_event(event_id, author_id, title, description, event_at, max_spots, c
         c.close()
 
 
-def delete_event(event_id, author_id):
+def _tx(fn):
     c = conn()
     try:
-        return c.execute("DELETE FROM events WHERE id=? AND author_id=?", (event_id, author_id)).rowcount > 0
+        c.execute("BEGIN IMMEDIATE")
+        res = fn(c)
+        if c.in_transaction:
+            c.execute("COMMIT")
+        return res
+    except Exception:
+        if c.in_transaction:
+            c.execute("ROLLBACK")
+        raise
     finally:
         c.close()
+
+
+def delete_event(event_id, author_id):
+    """Атомарне видалення події разом із записами й коментарями."""
+    def run(c):
+        if not c.execute("SELECT 1 FROM events WHERE id=? AND author_id=?", (event_id, author_id)).fetchone():
+            return False
+        c.execute("DELETE FROM comments WHERE event_id=?", (event_id,))
+        c.execute("DELETE FROM bookings WHERE event_id=?", (event_id,))
+        c.execute("DELETE FROM events WHERE id=? AND author_id=?", (event_id, author_id))
+        return True
+    return _tx(run)
+
+
+def unbook(event_id, user_id):
+    """'ok' | 'past' | 'none'."""
+    def run(c):
+        ev = c.execute("SELECT event_at FROM events WHERE id=?", (event_id,)).fetchone()
+        if ev and ev["event_at"] <= now_iso():
+            return "past"
+        n = c.execute("DELETE FROM bookings WHERE event_id=? AND user_id=?", (event_id, user_id)).rowcount
+        return "ok" if n else "none"
+    return _tx(run)
 
 
 def book(event_id, user_id):
